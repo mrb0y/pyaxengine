@@ -26,6 +26,8 @@ class InferenceSession(BaseInferenceSession):
 
         super(BaseInferenceSession).__init__()
 
+        self.device_id = device_id
+
         # load shared library
         self._rt_lib = _capi.R
         self._rt_ffi = _capi.O
@@ -34,12 +36,18 @@ class InferenceSession(BaseInferenceSession):
         print(f"[INFO] SOC Name: {self.soc_name}")
 
         # init axcl
+        self.axcl_device_id = -1  # axcl_device_id != device_id, device_id is just the index of the list of axcl_device_ids
         ret = self._init(device_id)
         if 0 != ret:
             raise RuntimeError("Failed to initialize axclrt.")
         print(f"[INFO] Runtime version: {self._get_version()}")
 
-        # handle, context, info, io
+        self._thread_context = self._rt_ffi.new("axclrtContext *")
+        ret = self._rt_lib.axclrtGetCurrentContext(self._thread_context)
+        if ret != 0:
+            raise RuntimeError("axclrtGetCurrentContext failed")
+
+        # model handle, context, info, io
         self._handle = self._rt_ffi.new("uint64_t *")
         self._context = self._rt_ffi.new("uint64_t *")
         self.io_info = self._rt_ffi.new("axclrtEngineIOInfo *")
@@ -249,14 +257,15 @@ class InferenceSession(BaseInferenceSession):
     def _init(self, device_id=0, vnpu=VNPUType.DISABLED):  # vnpu type, the default is disabled
         ret = self._rt_lib.axclInit([])
         if ret != 0:
-            raise RuntimeError("Failed to initialize runtime.")
+            raise RuntimeError(f"Failed to initialize runtime. {ret}.")
 
         lst = self._rt_ffi.new("axclrtDeviceList *")
         ret = self._rt_lib.axclrtGetDeviceList(lst)
         if ret != 0 or lst.num == 0:
             raise RuntimeError(f"Get AXCL device failed 0x{ret:08x}, find total {lst.num} device.")
 
-        ret = self._rt_lib.axclrtSetDevice(lst.devices[device_id])
+        self.axcl_device_id = lst.devices[device_id]
+        ret = self._rt_lib.axclrtSetDevice(self.axcl_device_id)
         if ret != 0 or lst.num == 0:
             raise RuntimeError(f"Set AXCL device failed 0x{ret:08x}.")
 
@@ -269,6 +278,7 @@ class InferenceSession(BaseInferenceSession):
     def _final(self):
         if self._handle[0] is not None:
             self._unload()
+        self._rt_lib.axclrtResetDevice(self.axcl_device_id)
         self._rt_lib.axclFinalize()
         return
 
@@ -331,6 +341,10 @@ class InferenceSession(BaseInferenceSession):
         self._validate_input(list(input_feed.keys()))
         self._validate_output(output_names)
 
+        ret = self._rt_lib.axclrtSetCurrentContext(self._thread_context[0])
+        if ret != 0:
+            raise RuntimeError("axclrtSetCurrentContext failed")
+
         if None is output_names:
             output_names = [o.name for o in self.get_outputs()]
 
@@ -384,8 +398,8 @@ class InferenceSession(BaseInferenceSession):
                    for i, output_tensor in enumerate(self.mgroup_output_tensors[grp_id])
                    if self.get_outputs()[i].name in output_names]
 
-        print(f'[INFO] cost time in host to device: {cost_host_to_device * 1009:.3f}ms, '
-              f'inference: {cost_inference * 1009:.3f}ms, '
-              f'device to host: {cost_device_to_host * 1009:.3f}ms')
+        print(f'[INFO] cost time in host to device: {cost_host_to_device * 1000:.3f}ms, '
+              f'inference: {cost_inference * 1000:.3f}ms, '
+              f'device to host: {cost_device_to_host * 1000:.3f}ms')
 
         return outputs
